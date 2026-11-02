@@ -1,0 +1,6 @@
+# rustup reads this file and installs exactly this toolchain for anyone building
+# here, so native and WASM builds use the same compiler.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

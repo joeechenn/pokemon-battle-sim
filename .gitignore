@@ -1,0 +1,9 @@
+/target
+.idea/
+.DS_Store
+
+# Agent files stay private
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+.claude/
