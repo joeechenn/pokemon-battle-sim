@@ -31,7 +31,7 @@ pub enum Type {
 impl Type {
     pub const COUNT: usize = 18;
 
-    /// Multiplier x4 against a one- or two-type defender (4 = neutral)
+    /// Multiplier x4 against a one- or two-type defender (4 = neutral).
     pub fn effectiveness(self, defender: (Type, Option<Type>)) -> u8 {
         let (primary, secondary) = defender;
         let first: u8 = TYPE_CHART[self as usize][primary as usize];
@@ -71,11 +71,11 @@ const TYPE_CHART: [[u8; Type::COUNT]; Type::COUNT] = [
     [2, 1, 2, 2, 2, 2, 4, 1, 2, 2, 2, 2, 2, 2, 4, 4, 1, 2],
 ];
 
-/// Index into `SPECIES`
+/// Index into `SPECIES`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpeciesId(pub u16);
 
-/// Index into `MOVES`
+/// Index into `MOVES`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MoveId(pub u16);
 
@@ -94,34 +94,30 @@ pub struct Species {
     pub name: &'static str,
     pub types: (Type, Option<Type>),
     pub base: BaseStats,
-    /// Body hitbox radius in units
+    /// Body hitbox radius in units.
     pub radius: i32,
     pub moves: [MoveId; 2],
 }
 
-/// Physical moves use Atk vs Def; special moves use SpA vs SpD
+/// Physical moves use Atk vs Def; special moves use SpA vs SpD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Category {
     Physical,
     Special,
 }
 
-/// How a move exists in the arena. Distances in units, durations in ticks
+/// How a move exists in the arena. Distances in units, durations in ticks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Archetype {
-    /// Flies in a straight line and hits the first fighter it touches
-    Projectile {
-        speed: i32,
-        radius: i32,
-        range: i32
-    },
-    /// A telegraphed circle placed up to `cast_range` away; lands after `delay`
+    /// Flies in a straight line and hits the first fighter it touches.
+    Projectile { speed: i32, radius: i32, range: i32 },
+    /// A telegraphed circle placed up to `cast_range` away; lands after `delay`.
     Zone {
         radius: i32,
         delay: u16,
         cast_range: i32,
     },
-    /// The user lunges `distance` over `duration` ticks and hits on contact
+    /// The user lunges `distance` over `duration` ticks and hits on contact..
     DashAttack {
         distance: i32,
         duration: u16,
@@ -135,11 +131,11 @@ pub struct Move {
     pub move_type: Type,
     pub category: Category,
     pub power: u16,
-    /// Ticks from command until the move is released
+    /// Ticks from command until the move is released.
     pub windup: u16,
-    /// Ticks after release before the user can act again
+    /// Ticks after release before the user can act again.
     pub recovery: u16,
-    /// Ticks from release until the move can be used again
+    /// Ticks from release until the move can be used again.
     pub cooldown: u16,
     pub archetype: Archetype,
 }
@@ -152,7 +148,7 @@ pub const THUNDER: MoveId = MoveId(1);
 pub const WATER_PULSE: MoveId = MoveId(2);
 pub const AQUA_JET: MoveId = MoveId(3);
 
-/// Entry `i` is the species with `SpeciesId(i)
+/// Entry `i` is the species with `SpeciesId(i).
 pub static SPECIES: [Species; 2] = [
     Species {
         name: "Pikachu",
