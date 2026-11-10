@@ -6,3 +6,8 @@ members = ["crates/sim-core"]
 [workspace.package]
 edition = "2024"
 license = "MIT"
+
+# Panic on integer overflow in release builds too (debug already does), so an
+# overflow bug fails loudly everywhere instead of silently wrapping.
+[profile.release]
+overflow-checks = true
