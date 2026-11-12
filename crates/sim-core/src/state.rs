@@ -14,6 +14,12 @@ use crate::data::{MoveId, SpeciesId};
 use crate::math::{Dir8, Vec2};
 use crate::rng::Rng;
 
+/// Half-width and half-height of the arena: 24 x 16 tiles. Placeholder to tune
+/// in the viewer; arena size is still open (DESIGN.md §9).
+pub const ARENA_HALF_EXTENTS: Vec2 = Vec2::new(12_000, 8_000);
+/// Each fighter starts this far from the center on the x axis (12 tiles apart).
+pub const SPAWN_OFFSET: i32 = 6_000;
+
 /// One fighter's input for one tick. Mirrors the brain's action space.
 /// `Intent::default()` means "do nothing".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -66,6 +72,24 @@ pub struct Fighter {
     pub action: Action,
 }
 
+impl Fighter {
+    /// Fresh fighter at full HP, idle, with every cooldown ready.
+    pub fn new(species: SpeciesId, pos: Vec2, facing: Dir8) -> Self {
+        let pokemon = crate::data::species(species);
+        let max_hp = crate::combat::max_hp(pokemon.base.hp);
+        Self {
+            species,
+            pos,
+            facing,
+            hp: max_hp,
+            max_hp,
+            move_cooldowns: [0, 0],
+            dash_cooldown: 0,
+            action: Action::Idle,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Projectile {
     /// Index into `State::fighters`.
@@ -113,9 +137,29 @@ pub struct State {
     pub outcome: Option<Outcome>,
 }
 
+impl State {
+    /// Tick 0 of a match (`reset` in the sim API). Fighters spawn mirrored
+    /// across the center, facing each other; `species[i]` is fighter `i`.
+    pub fn new(seed: u64, species: [SpeciesId; 2]) -> Self {
+        Self {
+            tick: 0,
+            rng: Rng::new(seed),
+            arena: ARENA_HALF_EXTENTS,
+            fighters: [
+                Fighter::new(species[0], Vec2::new(-SPAWN_OFFSET, 0), Dir8::E),
+                Fighter::new(species[1], Vec2::new(SPAWN_OFFSET, 0), Dir8::W),
+            ],
+            projectiles: Vec::new(),
+            zones: Vec::new(),
+            outcome: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::{BLASTOISE, PIKACHU};
 
     #[test]
     fn default_intent_does_nothing() {
@@ -123,5 +167,60 @@ mod tests {
         assert_eq!(intent.movement, None);
         assert!(!intent.dash);
         assert_eq!(intent.move_slot, None);
+    }
+
+    fn slice_match() -> State {
+        State::new(42, [PIKACHU, BLASTOISE])
+    }
+
+    #[test]
+    fn fighters_start_at_full_hp() {
+        let state = slice_match();
+        for f in &state.fighters {
+            assert_eq!(f.hp, f.max_hp);
+        }
+        assert_eq!(state.fighters[0].max_hp, 2200);
+        assert_eq!(state.fighters[1].max_hp, 3080);
+    }
+
+    #[test]
+    fn fighters_start_idle_with_cooldowns_ready() {
+        for f in &slice_match().fighters {
+            assert_eq!(f.action, Action::Idle);
+            assert_eq!(f.move_cooldowns, [0, 0]);
+            assert_eq!(f.dash_cooldown, 0);
+        }
+    }
+
+    #[test]
+    fn spawns_are_mirrored() {
+        let state = slice_match();
+        assert_eq!(state.fighters[1].pos, -state.fighters[0].pos);
+        assert_eq!(state.fighters[0].pos, Vec2::new(-SPAWN_OFFSET, 0));
+    }
+
+    #[test]
+    fn fighters_face_each_other() {
+        let state = slice_match();
+        assert_eq!(state.fighters[0].facing, Dir8::E);
+        assert_eq!(state.fighters[1].facing, Dir8::W);
+    }
+
+    #[test]
+    fn match_starts_empty() {
+        let state = slice_match();
+        assert_eq!(state.tick, 0);
+        assert!(state.projectiles.is_empty());
+        assert!(state.zones.is_empty());
+        assert_eq!(state.outcome, None);
+    }
+
+    #[test]
+    fn same_seed_gives_equal_states() {
+        assert_eq!(slice_match(), slice_match());
+        assert_ne!(
+            State::new(1, [PIKACHU, BLASTOISE]),
+            State::new(2, [PIKACHU, BLASTOISE])
+        );
     }
 }
