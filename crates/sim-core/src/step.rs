@@ -220,3 +220,189 @@ pub fn step(state: &mut State, intents: [Intent; 2]) -> Vec<Event> {
     state.tick += 1;
     events
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{BLASTOISE, PIKACHU};
+    use crate::math::Dir8;
+    use crate::state::Outcome;
+
+    /// Fighter 0 is Pikachu at (-6000, 0) facing east; fighter 1 is Blastoise.
+    fn new_match() -> State {
+        State::new(42, [PIKACHU, BLASTOISE])
+    }
+
+    /// `intent` for fighter 0; fighter 1 does nothing.
+    fn only_fighter_0(intent: Intent) -> [Intent; 2] {
+        [intent, Intent::default()]
+    }
+
+    fn walk(dir: Dir8) -> Intent {
+        Intent {
+            movement: Some(dir),
+            ..Intent::default()
+        }
+    }
+
+    fn dash() -> Intent {
+        Intent {
+            dash: true,
+            ..Intent::default()
+        }
+    }
+
+    #[test]
+    fn walking_moves_by_walk_speed() {
+        let mut state = new_match();
+        let start = state.fighters[0].pos;
+        step(&mut state, only_fighter_0(walk(Dir8::E)));
+        // Pikachu's walk speed is 157 units per tick.
+        assert_eq!(state.fighters[0].pos, start + Vec2::new(157, 0));
+    }
+
+    #[test]
+    fn walking_turns_to_face_the_direction() {
+        let mut state = new_match();
+        step(&mut state, only_fighter_0(walk(Dir8::N)));
+        assert_eq!(state.fighters[0].facing, Dir8::N);
+    }
+
+    #[test]
+    fn no_input_changes_nothing_but_the_tick() {
+        let mut state = new_match();
+        let before = state.clone();
+        let events = step(&mut state, [Intent::default(); 2]);
+        assert!(events.is_empty());
+        assert_eq!(state.fighters, before.fighters);
+        assert_eq!(state.tick, before.tick + 1);
+    }
+
+    #[test]
+    fn dash_goes_forward_then_recovers_then_idles() {
+        let mut state = new_match();
+        let start = state.fighters[0].pos;
+
+        // No movement input, so the dash goes the way Pikachu faces (east).
+        let events = step(&mut state, only_fighter_0(dash()));
+        assert_eq!(
+            events,
+            vec![Event::Dashed {
+                fighter: 0,
+                direction: Dir8::E,
+            }]
+        );
+
+        // Five more ticks finish the dash. Holding dash doesn't restart it.
+        for _ in 0..5 {
+            let events = step(&mut state, only_fighter_0(dash()));
+            assert!(events.is_empty());
+        }
+        assert_eq!(state.fighters[0].pos, start + Vec2::new(DASH_DISTANCE, 0));
+        assert_eq!(
+            state.fighters[0].action,
+            Action::Recovering {
+                ticks_left: DASH_RECOVERY,
+            }
+        );
+
+        // Recovery lasts DASH_RECOVERY ticks, without moving, then idle.
+        for _ in 0..DASH_RECOVERY {
+            step(&mut state, only_fighter_0(walk(Dir8::E)));
+        }
+        assert_eq!(state.fighters[0].pos, start + Vec2::new(DASH_DISTANCE, 0));
+        assert_eq!(state.fighters[0].action, Action::Idle);
+    }
+
+    #[test]
+    fn dash_follows_movement_input() {
+        let mut state = new_match();
+        let intent = Intent {
+            movement: Some(Dir8::S),
+            dash: true,
+            ..Intent::default()
+        };
+        step(&mut state, only_fighter_0(intent));
+        assert_eq!(state.fighters[0].facing, Dir8::S);
+        assert_eq!(
+            state.fighters[0].pos,
+            Vec2::new(-6_000, DASH_SPEED),
+            "y points down, so south is +y"
+        );
+    }
+
+    #[test]
+    fn dash_is_ready_again_exactly_one_cooldown_later() {
+        let mut state = new_match();
+        let mut dash_ticks = Vec::new();
+        // Hold dash for a little over one cooldown.
+        for _ in 0..=DASH_COOLDOWN {
+            let tick = state.tick;
+            let events = step(&mut state, only_fighter_0(dash()));
+            if !events.is_empty() {
+                dash_ticks.push(tick);
+            }
+        }
+        assert_eq!(dash_ticks, vec![0, u32::from(DASH_COOLDOWN)]);
+    }
+
+    #[test]
+    fn walls_stop_the_whole_body() {
+        let mut state = new_match();
+        for _ in 0..200 {
+            step(&mut state, only_fighter_0(walk(Dir8::W)));
+        }
+        let radius = data::species(PIKACHU).radius;
+        assert_eq!(state.fighters[0].pos.x, -state.arena.x + radius);
+        assert_eq!(state.fighters[0].pos.y, 0);
+    }
+
+    #[test]
+    fn overlapping_fighters_are_pushed_apart() {
+        let mut state = new_match();
+        state.fighters[0].pos = Vec2::new(0, 0);
+        state.fighters[1].pos = Vec2::new(100, 0);
+        step(&mut state, [Intent::default(); 2]);
+
+        let min = data::species(PIKACHU).radius + data::species(BLASTOISE).radius;
+        let dist = (state.fighters[1].pos - state.fighters[0].pos).length();
+        // Rounding the half-push down can leave them 1 unit short.
+        assert!(dist >= min - 1, "still overlapping: {dist} < {min}");
+        // Overlap was 800, so each moved 400: neither side is favored.
+        assert_eq!(state.fighters[0].pos, Vec2::new(-400, 0));
+        assert_eq!(state.fighters[1].pos, Vec2::new(500, 0));
+    }
+
+    #[test]
+    fn fighters_on_the_same_spot_still_separate() {
+        let mut state = new_match();
+        state.fighters[0].pos = Vec2::ZERO;
+        state.fighters[1].pos = Vec2::ZERO;
+        step(&mut state, [Intent::default(); 2]);
+
+        assert!(state.fighters[0].pos.x < 0, "fighter 0 goes left");
+        assert!(state.fighters[1].pos.x > 0, "fighter 1 goes right");
+    }
+
+    #[test]
+    fn finished_match_does_not_change() {
+        let mut state = new_match();
+        state.outcome = Some(Outcome::Draw);
+        let before = state.clone();
+        let events = step(&mut state, only_fighter_0(dash()));
+        assert!(events.is_empty());
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn same_inputs_give_same_states() {
+        let mut a = new_match();
+        let mut b = new_match();
+        let script = [walk(Dir8::NE), dash(), walk(Dir8::W), Intent::default()];
+        for intent in script.iter().cycle().take(120) {
+            step(&mut a, [*intent, walk(Dir8::SW)]);
+            step(&mut b, [*intent, walk(Dir8::SW)]);
+        }
+        assert_eq!(a, b);
+    }
+}
