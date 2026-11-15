@@ -14,13 +14,13 @@ use crate::data::{MoveId, SpeciesId};
 use crate::math::{Dir8, Vec2};
 use crate::rng::Rng;
 
-/// Half-width and half-height of the arena: 24 x 16 tiles. Placeholder to tune
-/// in the viewer; arena size is still open (DESIGN.md §9).
+/// Half-width and half-height of the arena: 24 x 16 tiles. A starting value,
+/// not final; to be tuned through play.
 pub const ARENA_HALF_EXTENTS: Vec2 = Vec2::new(12_000, 8_000);
 /// Each fighter starts this far from the center on the x axis (12 tiles apart).
 pub const SPAWN_OFFSET: i32 = 6_000;
 
-/// One fighter's input for one tick. Mirrors the brain's action space.
+/// One fighter's input for one tick, from a player or an AI controller.
 /// `Intent::default()` means "do nothing".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Intent {
@@ -169,13 +169,13 @@ mod tests {
         assert_eq!(intent.move_slot, None);
     }
 
-    fn slice_match() -> State {
+    fn pikachu_vs_blastoise() -> State {
         State::new(42, [PIKACHU, BLASTOISE])
     }
 
     #[test]
     fn fighters_start_at_full_hp() {
-        let state = slice_match();
+        let state = pikachu_vs_blastoise();
         for f in &state.fighters {
             assert_eq!(f.hp, f.max_hp);
         }
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn fighters_start_idle_with_cooldowns_ready() {
-        for f in &slice_match().fighters {
+        for f in &pikachu_vs_blastoise().fighters {
             assert_eq!(f.action, Action::Idle);
             assert_eq!(f.move_cooldowns, [0, 0]);
             assert_eq!(f.dash_cooldown, 0);
@@ -194,21 +194,21 @@ mod tests {
 
     #[test]
     fn spawns_are_mirrored() {
-        let state = slice_match();
+        let state = pikachu_vs_blastoise();
         assert_eq!(state.fighters[1].pos, -state.fighters[0].pos);
         assert_eq!(state.fighters[0].pos, Vec2::new(-SPAWN_OFFSET, 0));
     }
 
     #[test]
     fn fighters_face_each_other() {
-        let state = slice_match();
+        let state = pikachu_vs_blastoise();
         assert_eq!(state.fighters[0].facing, Dir8::E);
         assert_eq!(state.fighters[1].facing, Dir8::W);
     }
 
     #[test]
     fn match_starts_empty() {
-        let state = slice_match();
+        let state = pikachu_vs_blastoise();
         assert_eq!(state.tick, 0);
         assert!(state.projectiles.is_empty());
         assert!(state.zones.is_empty());
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn same_seed_gives_equal_states() {
-        assert_eq!(slice_match(), slice_match());
+        assert_eq!(pikachu_vs_blastoise(), pikachu_vs_blastoise());
         assert_ne!(
             State::new(1, [PIKACHU, BLASTOISE]),
             State::new(2, [PIKACHU, BLASTOISE])

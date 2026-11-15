@@ -1,7 +1,5 @@
 //! Controllers produce one `Intent` per fighter per tick.
 //!
-//! To add: `trait Controller { fn intent(&mut self, state: &State, me: usize)
-//! -> Intent; }`, plus a scripted controller for tests. The keyboard
-//! controller lives in the viewer; the utility AI and the brain come later.
-//!
-//! Rust concepts: traits (like TypeScript interfaces), `&mut self`.
+//! TODO: `trait Controller { fn intent(&mut self, state: &State, me: usize)
+//! -> Intent; }`, plus a scripted controller for tests. Keyboard and AI
+//! controllers implement the same trait.

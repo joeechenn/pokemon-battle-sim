@@ -91,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn damage_in_the_slice_matchup() {
+    fn damage_pikachu_vs_blastoise() {
         let pika = species(PIKACHU);
         let blast = species(BLASTOISE);
         assert_eq!(damage(pika, blast, move_data(THUNDERBOLT)), 302);

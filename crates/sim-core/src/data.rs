@@ -1,7 +1,7 @@
 //! Static game data: types, species, moves.
 //!
-//! Read-only during a match. Hard-coded tables for the slice; later this
-//! becomes the data schema the sim repo owns and loads from files.
+//! Read-only during a match. The tables are hard-coded for now; later they
+//! will be loaded from data files.
 //!
 //! State refers to species and moves by id (`SpeciesId`, `MoveId`), which
 //! index into `SPECIES` and `MOVES`. Game logic never names a species.
@@ -148,7 +148,7 @@ pub const THUNDER: MoveId = MoveId(1);
 pub const WATER_PULSE: MoveId = MoveId(2);
 pub const AQUA_JET: MoveId = MoveId(3);
 
-/// Entry `i` is the species with `SpeciesId(i).
+/// Entry `i` is the species with `SpeciesId(i)`.
 pub static SPECIES: [Species; 2] = [
     Species {
         name: "Pikachu",
@@ -181,7 +181,7 @@ pub static SPECIES: [Species; 2] = [
 ];
 
 /// Entry `i` is the move with `MoveId(i)`. Timing and geometry are starting
-/// values to tune in the viewer.
+/// values, to be tuned through play.
 pub static MOVES: [Move; 4] = [
     Move {
         name: "Thunderbolt",
