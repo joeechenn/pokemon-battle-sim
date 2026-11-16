@@ -356,6 +356,52 @@ fn advance_projectiles(state: &mut State, events: &mut Vec<Event>) {
     });
 }
 
+/// Counts telegraphed zones down and lands the ones whose time is up.
+///
+/// A zone lands on the tick its `ticks_left` reaches 1, so it lands exactly
+/// `delay` ticks after it was placed. Landing always emits `ZoneLanded`; if the
+/// opponent's body overlaps the circle (the caster is never hit), a `Hit`
+/// follows. A landed zone is removed whether or not it hit.
+fn advance_zones(state: &mut State, events: &mut Vec<Event>) {
+    state.zones.retain_mut(|z| {
+        if z.ticks_left > 1 {
+            z.ticks_left -= 1;
+            return true;
+        }
+
+        events.push(Event::ZoneLanded {
+            owner: z.owner,
+            move_id: z.move_id,
+            center: z.center,
+        });
+
+        let mv = data::move_data(z.move_id);
+        let Archetype::Zone { radius, .. } = mv.archetype else {
+            unreachable!("zone spawned from a non-zone move");
+        };
+        // Same lookups as projectiles: `attacker` points into the static
+        // species table, so it doesn't conflict with borrowing the target.
+        let attacker = data::species(state.fighters[usize::from(z.owner)].species);
+        let target = &mut state.fighters[usize::from(1 - z.owner)];
+        let target_species = data::species(target.species);
+
+        let dist = (target.pos - z.center).length();
+        if dist < radius + target_species.radius {
+            let dmg = damage(attacker, target_species, mv);
+            target.hp = (target.hp - dmg).max(0);
+            events.push(Event::Hit {
+                attacker: z.owner,
+                target: 1 - z.owner,
+                move_id: z.move_id,
+                damage: dmg,
+                effectiveness: mv.move_type.effectiveness(target_species.types),
+            });
+        }
+        // Landed: removed whether or not it hit, so it can't land again.
+        false
+    });
+}
+
 /// Advance the match by one tick. `intents[i]` is fighter `i`'s input.
 ///
 /// Mutates `state` in place and returns what happened this tick for the
@@ -376,7 +422,8 @@ pub fn step(state: &mut State, intents: [Intent; 2]) -> Vec<Event> {
     clamp_to_arena(state.arena, &mut state.fighters);
     advance_casts(state, &mut events);
     advance_projectiles(state, &mut events);
-    // TODO: zones, lunges, faints and end-of-match checks.
+    advance_zones(state, &mut events);
+    // TODO: lunges, faints and end-of-match checks.
     tick_cooldowns(&mut state.fighters);
 
     state.tick += 1;
@@ -921,5 +968,134 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(state.fighters[0].hp, 2_200 - 270);
         assert_eq!(state.fighters[1].hp, 3_080 - 302);
+    }
+
+    /// A Thunder zone placed directly in the arena.
+    fn thunder_zone(owner: u8, center: Vec2, ticks_left: u16) -> Zone {
+        Zone {
+            owner,
+            move_id: THUNDER,
+            center,
+            ticks_left,
+        }
+    }
+
+    /// Far from both fighters, so a zone here always misses.
+    const EMPTY_SPOT: Vec2 = Vec2::new(0, -6_000);
+
+    #[test]
+    fn zone_counts_down_then_lands() {
+        let mut state = new_match();
+        state.zones.push(thunder_zone(0, EMPTY_SPOT, 3));
+
+        assert!(step(&mut state, [Intent::default(); 2]).is_empty());
+        assert_eq!(state.zones[0].ticks_left, 2);
+        assert!(step(&mut state, [Intent::default(); 2]).is_empty());
+        assert_eq!(state.zones[0].ticks_left, 1);
+
+        let events = step(&mut state, [Intent::default(); 2]);
+        assert_eq!(
+            events,
+            vec![Event::ZoneLanded {
+                owner: 0,
+                move_id: THUNDER,
+                center: EMPTY_SPOT,
+            }]
+        );
+    }
+
+    #[test]
+    fn thunder_lands_exactly_delay_ticks_after_release() {
+        let mut state = new_match();
+        let delay = 24;
+        step(&mut state, only_fighter_0(use_move(1)));
+        // Release tick: placed with `delay` and already counted down once.
+        run(
+            &mut state,
+            [Intent::default(); 2],
+            move_data(THUNDER).windup - 1,
+        );
+        assert_eq!(state.zones[0].ticks_left, delay - 1);
+
+        // Still waiting after delay - 2 more ticks...
+        run(&mut state, [Intent::default(); 2], delay - 2);
+        assert_eq!(state.zones.len(), 1);
+
+        // ...and lands on the next, the `delay`-th tick counting the release.
+        let events = run(&mut state, [Intent::default(); 2], 1);
+        assert!(matches!(events[..], [Event::ZoneLanded { owner: 0, .. }]));
+        assert!(state.zones.is_empty());
+    }
+
+    #[test]
+    fn thunder_hits_blastoise_for_369() {
+        let mut state = new_match();
+        let blastoise = state.fighters[1].pos;
+        state.zones.push(thunder_zone(0, blastoise, 1));
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        // Landing first, then the hit.
+        assert_eq!(
+            events,
+            vec![
+                Event::ZoneLanded {
+                    owner: 0,
+                    move_id: THUNDER,
+                    center: blastoise,
+                },
+                Event::Hit {
+                    attacker: 0,
+                    target: 1,
+                    move_id: THUNDER,
+                    damage: 369,
+                    effectiveness: 8,
+                },
+            ]
+        );
+        assert_eq!(state.fighters[1].hp, 3_080 - 369);
+    }
+
+    #[test]
+    fn zone_hits_when_only_the_body_overlaps() {
+        // Thunder's radius is 1500 and Blastoise's is 550, so they touch at
+        // 2050 apart. At 2000, Blastoise's center is outside the circle but
+        // its body overlaps it.
+        let mut state = new_match();
+        state.zones.push(thunder_zone(0, Vec2::new(4_000, 0), 1));
+        let events = step(&mut state, [Intent::default(); 2]);
+        assert!(matches!(events[..], [_, Event::Hit { .. }]));
+    }
+
+    #[test]
+    fn zone_just_touching_misses() {
+        let mut state = new_match();
+        state.zones.push(thunder_zone(0, Vec2::new(3_950, 0), 1));
+        let events = step(&mut state, [Intent::default(); 2]);
+        assert!(matches!(events[..], [Event::ZoneLanded { .. }]));
+        assert_eq!(state.fighters[1].hp, state.fighters[1].max_hp);
+    }
+
+    #[test]
+    fn missed_zone_lands_once_and_is_removed() {
+        let mut state = new_match();
+        state.zones.push(thunder_zone(0, EMPTY_SPOT, 1));
+
+        let events = step(&mut state, [Intent::default(); 2]);
+        assert!(matches!(events[..], [Event::ZoneLanded { .. }]));
+        assert!(state.zones.is_empty());
+
+        // Nothing lands a second time.
+        assert!(step(&mut state, [Intent::default(); 2]).is_empty());
+    }
+
+    #[test]
+    fn zone_never_hits_its_caster() {
+        let mut state = new_match();
+        let pikachu = state.fighters[0].pos;
+        state.zones.push(thunder_zone(0, pikachu, 1));
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        assert!(matches!(events[..], [Event::ZoneLanded { .. }]));
+        assert_eq!(state.fighters[0].hp, state.fighters[0].max_hp);
     }
 }
