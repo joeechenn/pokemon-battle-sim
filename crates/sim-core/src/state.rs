@@ -49,12 +49,12 @@ pub enum Action {
     Recovering {
         ticks_left: u16,
     },
-    /// A dash-attack move in flight. `has_hit` stops it hitting twice.
+    /// A dash-attack move in flight. It ends early if it hits, so it can only
+    /// hit once.
     Lunging {
         slot: u8,
         velocity: Vec2,
         ticks_left: u16,
-        has_hit: bool,
     },
 }
 

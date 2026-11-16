@@ -136,8 +136,28 @@ fn move_fighters(fighters: &mut [Fighter; 2], intents: &[Intent; 2]) {
                     Action::Idle
                 };
             }
-            // TODO: dash-attack movement and contact hits.
-            Action::Lunging { .. } => {}
+            // A lunge that runs its full length missed; contact hits are
+            // checked separately, after separation and the wall clamp.
+            Action::Lunging {
+                slot,
+                velocity,
+                ticks_left,
+            } => {
+                f.pos += velocity;
+                let species = data::species(f.species);
+                let mv = data::move_data(species.moves[usize::from(slot)]);
+                f.action = if ticks_left > 1 {
+                    Action::Lunging {
+                        slot,
+                        velocity,
+                        ticks_left: ticks_left - 1,
+                    }
+                } else {
+                    Action::Recovering {
+                        ticks_left: mv.recovery,
+                    }
+                };
+            }
         }
     }
 }
@@ -300,7 +320,6 @@ fn advance_casts(state: &mut State, events: &mut Vec<Event>) {
                     slot,
                     velocity: aim.with_length(distance / duration as i32),
                     ticks_left: duration,
-                    has_hit: false,
                 };
             }
         }
@@ -402,6 +421,54 @@ fn advance_zones(state: &mut State, events: &mut Vec<Event>) {
     });
 }
 
+/// Checks lunging fighters for contact with the opponent.
+///
+/// The hitbox is the move's own radius around the lunging fighter, slightly
+/// larger than its body, so it still connects after `separate_fighters` has
+/// pushed the two bodies apart. A hit ends the lunge immediately and starts the
+/// move's recovery, so a lunge hits at most once.
+fn lunge_hits(state: &mut State, events: &mut Vec<Event>) {
+    // The loop borrows `fighters` mutably, so the opponent is read from these
+    // copies and its damage is applied after the loop.
+    let positions = [state.fighters[0].pos, state.fighters[1].pos];
+    let species_ids = [state.fighters[0].species, state.fighters[1].species];
+    let mut damage_taken = [0; 2];
+
+    for (i, f) in state.fighters.iter_mut().enumerate() {
+        let Action::Lunging { slot, .. } = f.action else {
+            continue;
+        };
+        let species = data::species(f.species);
+        let move_id = species.moves[usize::from(slot)];
+        let mv = data::move_data(move_id);
+        let Archetype::DashAttack { radius, .. } = mv.archetype else {
+            unreachable!("lunge from a non-dash-attack move");
+        };
+
+        let t = 1 - i;
+        let target_species = data::species(species_ids[t]);
+        let dist = (positions[t] - f.pos).length();
+        if dist < radius + target_species.radius {
+            let dmg = damage(species, target_species, mv);
+            damage_taken[t] += dmg;
+            events.push(Event::Hit {
+                attacker: i as u8,
+                target: t as u8,
+                move_id,
+                damage: dmg,
+                effectiveness: mv.move_type.effectiveness(target_species.types),
+            });
+            f.action = Action::Recovering {
+                ticks_left: mv.recovery,
+            };
+        }
+    }
+
+    for (f, dmg) in state.fighters.iter_mut().zip(damage_taken) {
+        f.hp = (f.hp - dmg).max(0);
+    }
+}
+
 /// Advance the match by one tick. `intents[i]` is fighter `i`'s input.
 ///
 /// Mutates `state` in place and returns what happened this tick for the
@@ -420,10 +487,11 @@ pub fn step(state: &mut State, intents: [Intent; 2]) -> Vec<Event> {
     // `state.arena` is copied while `state.fighters` is borrowed: different
     // fields, so both are allowed at once.
     clamp_to_arena(state.arena, &mut state.fighters);
+    lunge_hits(state, &mut events);
     advance_casts(state, &mut events);
     advance_projectiles(state, &mut events);
     advance_zones(state, &mut events);
-    // TODO: lunges, faints and end-of-match checks.
+    // TODO: faints and end-of-match checks.
     tick_cooldowns(&mut state.fighters);
 
     state.tick += 1;
@@ -796,8 +864,7 @@ mod tests {
                 slot: 1,
                 // Pikachu is due west; 4000 units over 8 ticks.
                 velocity: Vec2::new(-500, 0),
-                ticks_left: 8,
-                has_hit: false,
+                ticks_left: 8
             }
         );
         assert!(state.projectiles.is_empty());
@@ -1097,5 +1164,116 @@ mod tests {
 
         assert!(matches!(events[..], [Event::ZoneLanded { .. }]));
         assert_eq!(state.fighters[0].hp, state.fighters[0].max_hp);
+    }
+
+    /// Blastoise (fighter 1) mid-Aqua-Jet, heading west at 500 per tick.
+    fn aqua_jet_west() -> Action {
+        Action::Lunging {
+            slot: 1,
+            velocity: Vec2::new(-500, 0),
+            ticks_left: 8,
+        }
+    }
+
+    fn no_hits(events: &[Event]) -> bool {
+        !events.iter().any(|e| matches!(e, Event::Hit { .. }))
+    }
+
+    #[test]
+    fn missed_lunge_runs_its_full_length_then_recovers() {
+        let mut state = new_match();
+        let windup = move_data(AQUA_JET).windup;
+        step(&mut state, [Intent::default(), use_move(1)]);
+        run(&mut state, [Intent::default(); 2], windup - 1);
+        assert!(matches!(
+            state.fighters[1].action,
+            Action::Lunging { ticks_left: 8, .. }
+        ));
+
+        // From 12,000 apart, 4,000 of lunge can't reach Pikachu.
+        for _ in 0..8 {
+            assert!(no_hits(&step(&mut state, [Intent::default(); 2])));
+        }
+        assert_eq!(state.fighters[1].pos, Vec2::new(6_000 - 4_000, 0));
+        assert_eq!(
+            state.fighters[1].action,
+            Action::Recovering {
+                ticks_left: move_data(AQUA_JET).recovery,
+            }
+        );
+    }
+
+    #[test]
+    fn lunge_hits_on_contact_for_206_and_stops() {
+        let mut state = new_match();
+        // One step west of Pikachu at (-6000, 0): the bodies overlap, are
+        // pushed apart to touching (900), and the 600 hitbox still reaches.
+        state.fighters[1].pos = Vec2::new(-5_000, 0);
+        state.fighters[1].action = aqua_jet_west();
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        assert_eq!(
+            events,
+            vec![Event::Hit {
+                attacker: 1,
+                target: 0,
+                move_id: AQUA_JET,
+                damage: 206,
+                effectiveness: 4,
+            }]
+        );
+        assert_eq!(state.fighters[0].hp, 2_200 - 206);
+        assert_eq!(
+            state.fighters[1].action,
+            Action::Recovering {
+                ticks_left: move_data(AQUA_JET).recovery,
+            },
+            "a hit ends the lunge"
+        );
+    }
+
+    #[test]
+    fn lunge_hits_only_once() {
+        let mut state = new_match();
+        state.fighters[1].pos = Vec2::new(-5_000, 0);
+        state.fighters[1].action = aqua_jet_west();
+        step(&mut state, [Intent::default(); 2]);
+
+        // Still touching Pikachu while recovering, but no second hit.
+        for _ in 0..10 {
+            assert!(no_hits(&step(&mut state, [Intent::default(); 2])));
+        }
+        assert_eq!(state.fighters[0].hp, 2_200 - 206);
+    }
+
+    #[test]
+    fn aqua_jet_from_a_key_press_hits_a_nearby_target() {
+        let mut state = new_match();
+        state.fighters[1].pos = Vec2::new(-4_000, 0);
+        let mut hits = Vec::new();
+        step(&mut state, [Intent::default(), use_move(1)]);
+        for _ in 0..12 {
+            let events = step(&mut state, [Intent::default(); 2]);
+            hits.extend(
+                events
+                    .into_iter()
+                    .filter(|e| matches!(e, Event::Hit { .. })),
+            );
+        }
+        assert!(matches!(hits[..], [Event::Hit { damage: 206, .. }]));
+    }
+
+    #[test]
+    fn lunge_stops_at_the_wall() {
+        let mut state = new_match();
+        state.fighters[1].pos = Vec2::new(11_000, 0);
+        state.fighters[1].action = Action::Lunging {
+            slot: 1,
+            velocity: Vec2::new(500, 0),
+            ticks_left: 8,
+        };
+        run(&mut state, [Intent::default(); 2], 8);
+        let radius = data::species(BLASTOISE).radius;
+        assert_eq!(state.fighters[1].pos.x, state.arena.x - radius);
     }
 }
