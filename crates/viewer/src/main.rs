@@ -32,7 +32,7 @@ const MAX_TICKS_PER_FRAME: u32 = 5;
 const EVENT_LOG_LEN: usize = 12;
 
 const MARGIN: f32 = 24.0;
-const PANEL_WIDTH: f32 = 360.0;
+const PANEL_WIDTH: f32 = 400.0;
 const LINE: f32 = 22.0;
 const FONT: f32 = 20.0;
 
@@ -261,7 +261,7 @@ impl Viewer {
 
         line("events", TEXT);
         for (tick, event) in &self.log {
-            line(&format!("  {tick:>5}  {event:?}"), DIM);
+            line(&format!("  {tick:>5}  {}", self.event_label(event)), DIM);
         }
         line("", TEXT);
 
@@ -270,6 +270,58 @@ impl Viewer {
         line("WASD/arrows move   Space dash", DIM);
         line(&format!("J {}   K {}", move_name(0), move_name(1)), DIM);
         line("Tab switch fighter   P pause   R restart", DIM);
+    }
+
+    /// Short, readable form of an event for the log, with fighters and moves
+    /// shown by name.
+    fn event_label(&self, event: &Event) -> String {
+        let fighter = |i: u8| data::species(self.state.fighters[usize::from(i)].species).name;
+        let mv = |id| data::move_data(id).name;
+        match *event {
+            Event::MoveStarted {
+                fighter: f,
+                move_id,
+            } => {
+                format!("{} uses {}", fighter(f), mv(move_id))
+            }
+            Event::ProjectileSpawned { move_id, .. } => format!("{} fired", mv(move_id)),
+            Event::ProjectileExpired { move_id, .. } => format!("{} fizzled", mv(move_id)),
+            Event::TelegraphStarted { move_id, delay, .. } => {
+                format!("{} lands in {delay} ticks", mv(move_id))
+            }
+            Event::ZoneLanded { move_id, .. } => format!("{} landed", mv(move_id)),
+            Event::Dashed {
+                fighter: f,
+                direction,
+            } => format!("{} dashed {direction:?}", fighter(f)),
+            Event::Hit {
+                target,
+                move_id,
+                damage,
+                effectiveness,
+                ..
+            } => format!(
+                "{} hit {} for {damage}{}",
+                mv(move_id),
+                fighter(target),
+                effectiveness_label(effectiveness)
+            ),
+            Event::Fainted { fighter: f } => format!("{} fainted", fighter(f)),
+            Event::MatchEnded { outcome } => format!("match over: {outcome:?}"),
+        }
+    }
+}
+
+/// Type multiplier suffix for hit labels. `effectiveness` is the x4 scale
+/// from `Type::effectiveness` (4 = neutral, shown as nothing).
+fn effectiveness_label(effectiveness: u8) -> &'static str {
+    match effectiveness {
+        0 => " (immune)",
+        1 => " (x0.25)",
+        2 => " (x0.5)",
+        8 => " (x2)",
+        16 => " (x4)",
+        _ => "",
     }
 }
 
