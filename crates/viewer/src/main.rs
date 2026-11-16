@@ -20,8 +20,8 @@ use sim_core::TICKS_PER_SECOND;
 use sim_core::data::{self, Archetype, BLASTOISE, PIKACHU};
 use sim_core::event::Event;
 use sim_core::math::{Dir8, UNITS_PER_TILE, Vec2};
-use sim_core::state::{Action, Fighter, Intent, State};
-use sim_core::step::step;
+use sim_core::state::{Action, Fighter, Intent, Outcome, State};
+use sim_core::step::{MATCH_TICKS, step};
 
 /// Real seconds per sim tick.
 const TICK_SECONDS: f32 = 1.0 / TICKS_PER_SECOND as f32;
@@ -32,7 +32,7 @@ const MAX_TICKS_PER_FRAME: u32 = 5;
 const EVENT_LOG_LEN: usize = 12;
 
 const MARGIN: f32 = 24.0;
-const PANEL_WIDTH: f32 = 400.0;
+const PANEL_WIDTH: f32 = 440.0;
 const LINE: f32 = 22.0;
 const FONT: f32 = 20.0;
 
@@ -230,16 +230,20 @@ impl Viewer {
         };
 
         let tick = self.state.tick;
+        let ticks_left = MATCH_TICKS.saturating_sub(tick);
         line(
-            &format!("tick {tick}  ({:.1} s)", tick as f32 * TICK_SECONDS),
+            &format!("time left {:.1} s", ticks_left as f32 * TICK_SECONDS),
             TEXT,
         );
-        line(&format!("seed {}", self.seed), DIM);
+        line(&format!("tick {tick}   seed {}", self.seed), DIM);
         if self.paused {
             line("PAUSED  (N = step one tick)", FIGHTER_COLORS[0]);
         }
         if let Some(outcome) = self.state.outcome {
-            line(&format!("match over: {outcome:?}"), FIGHTER_COLORS[0]);
+            line(
+                &format!("match over: {}  (R restarts)", self.outcome_label(outcome)),
+                FIGHTER_COLORS[0],
+            );
         }
         line("", TEXT);
 
@@ -307,7 +311,18 @@ impl Viewer {
                 effectiveness_label(effectiveness)
             ),
             Event::Fainted { fighter: f } => format!("{} fainted", fighter(f)),
-            Event::MatchEnded { outcome } => format!("match over: {outcome:?}"),
+            Event::MatchEnded { outcome } => format!("match over: {}", self.outcome_label(outcome)),
+        }
+    }
+
+    /// The result in words, with the winner by name.
+    fn outcome_label(&self, outcome: Outcome) -> String {
+        match outcome {
+            Outcome::Winner(i) => {
+                let name = data::species(self.state.fighters[usize::from(i)].species).name;
+                format!("{name} wins")
+            }
+            Outcome::Draw => "draw (a loss for both)".to_owned(),
         }
     }
 }
