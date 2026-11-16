@@ -14,7 +14,7 @@
 //! Both fighters move before any hit is tested, so fighter 0 gets no advantage
 //! from being processed first.
 
-use crate::combat::move_speed;
+use crate::combat::{damage, move_speed};
 use crate::data;
 use crate::data::Archetype;
 use crate::event::Event;
@@ -307,6 +307,55 @@ fn advance_casts(state: &mut State, events: &mut Vec<Event>) {
     }
 }
 
+/// Moves projectiles, applies hits, and removes spent ones.
+///
+/// A projectile hits the opponent (never its owner) when their circles
+/// overlap, and expires at the end of its range or when its edge touches a
+/// wall. A hit is checked before expiry, so a hit on the last tick of range
+/// still counts. HP is lowered here; faints are checked after every hit this
+/// tick has been applied, so simultaneous knockouts are treated fairly.
+fn advance_projectiles(state: &mut State, events: &mut Vec<Event>) {
+    state.projectiles.retain_mut(|p| {
+        p.pos += p.velocity;
+        p.range_left -= p.velocity.length();
+        let mv = data::move_data(p.move_id);
+        let Archetype::Projectile { radius, .. } = mv.archetype else {
+            unreachable!("projectile spawned from a non-projectile move");
+        };
+        // Look each species up once. `attacker` points into the static
+        // species table, not into `state`, so holding it doesn't block the
+        // mutable borrow of the target below.
+        let attacker = data::species(state.fighters[usize::from(p.owner)].species);
+        let target = &mut state.fighters[usize::from(1 - p.owner)];
+        let target_species = data::species(target.species);
+
+        let dist = (target.pos - p.pos).length();
+
+        let outside =
+            p.pos.x.abs() + radius > state.arena.x || p.pos.y.abs() + radius > state.arena.y;
+        if dist < radius + target_species.radius {
+            let dmg = damage(attacker, target_species, mv);
+            target.hp = (target.hp - dmg).max(0);
+            events.push(Event::Hit {
+                attacker: p.owner,
+                target: 1 - p.owner,
+                move_id: p.move_id,
+                damage: dmg,
+                effectiveness: mv.move_type.effectiveness(target_species.types),
+            });
+            return false;
+        }
+        if p.range_left <= 0 || outside {
+            events.push(Event::ProjectileExpired {
+                move_id: p.move_id,
+                pos: p.pos,
+            });
+            return false;
+        }
+        true
+    });
+}
+
 /// Advance the match by one tick. `intents[i]` is fighter `i`'s input.
 ///
 /// Mutates `state` in place and returns what happened this tick for the
@@ -326,7 +375,8 @@ pub fn step(state: &mut State, intents: [Intent; 2]) -> Vec<Event> {
     // fields, so both are allowed at once.
     clamp_to_arena(state.arena, &mut state.fighters);
     advance_casts(state, &mut events);
-    // TODO: projectiles, zones, lunges, damage and end-of-match checks.
+    advance_projectiles(state, &mut events);
+    // TODO: zones, lunges, faints and end-of-match checks.
     tick_cooldowns(&mut state.fighters);
 
     state.tick += 1;
@@ -336,7 +386,9 @@ pub fn step(state: &mut State, intents: [Intent; 2]) -> Vec<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{AQUA_JET, BLASTOISE, PIKACHU, THUNDER, THUNDERBOLT, move_data};
+    use crate::data::{
+        AQUA_JET, BLASTOISE, MoveId, PIKACHU, THUNDER, THUNDERBOLT, WATER_PULSE, move_data,
+    };
     use crate::math::Dir8;
     use crate::state::Outcome;
 
@@ -611,10 +663,12 @@ mod tests {
             vec![Projectile {
                 owner: 0,
                 move_id: THUNDERBOLT,
-                pos: Vec2::new(-6_000, 0),
+                // Spawned at Pikachu (-6000, 0), then already moved one
+                // tick, since projectiles advance on the tick they're released.
+                pos: Vec2::new(-5_500, 0),
                 // Blastoise is due east; 500 is Thunderbolt's speed.
                 velocity: Vec2::new(500, 0),
-                range_left: 9_000,
+                range_left: 9_000 - 500,
             }]
         );
         assert!(matches!(
@@ -702,5 +756,170 @@ mod tests {
         assert!(state.projectiles.is_empty());
         assert!(state.zones.is_empty());
         assert_eq!(state.fighters[1].move_cooldowns[1], mv.cooldown - 1);
+    }
+
+    /// A projectile placed directly in the arena, with 9000 range left.
+    fn shot(owner: u8, move_id: MoveId, pos: Vec2, velocity: Vec2) -> Projectile {
+        Projectile {
+            owner,
+            move_id,
+            pos,
+            velocity,
+            range_left: 9_000,
+        }
+    }
+
+    #[test]
+    fn projectile_moves_and_spends_range() {
+        let mut state = new_match();
+        // Above both fighters, so it can't hit anything.
+        let start = Vec2::new(0, -5_000);
+        state
+            .projectiles
+            .push(shot(0, THUNDERBOLT, start, Vec2::new(500, 0)));
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        assert!(events.is_empty());
+        assert_eq!(state.projectiles[0].pos, start + Vec2::new(500, 0));
+        assert_eq!(state.projectiles[0].range_left, 8_500);
+    }
+
+    #[test]
+    fn thunderbolt_hits_blastoise_for_302() {
+        let mut state = new_match();
+        // One tick short of Blastoise at (6000, 0).
+        state
+            .projectiles
+            .push(shot(0, THUNDERBOLT, Vec2::new(5_000, 0), Vec2::new(500, 0)));
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        assert_eq!(
+            events,
+            vec![Event::Hit {
+                attacker: 0,
+                target: 1,
+                move_id: THUNDERBOLT,
+                damage: 302,
+                // Electric vs Water: x2, written as 8 on the x4 scale.
+                effectiveness: 8,
+            }]
+        );
+        assert_eq!(state.fighters[1].hp, 3_080 - 302);
+        assert!(state.projectiles.is_empty(), "a hit removes the projectile");
+    }
+
+    #[test]
+    fn water_pulse_hits_pikachu_for_270() {
+        let mut state = new_match();
+        state.projectiles.push(shot(
+            1,
+            WATER_PULSE,
+            Vec2::new(-5_000, 0),
+            Vec2::new(-330, 0),
+        ));
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        assert!(matches!(
+            events[..],
+            [Event::Hit {
+                attacker: 1,
+                target: 0,
+                damage: 270,
+                effectiveness: 4,
+                ..
+            }]
+        ));
+        assert_eq!(state.fighters[0].hp, 2_200 - 270);
+    }
+
+    #[test]
+    fn projectile_never_hits_its_owner() {
+        let mut state = new_match();
+        // Starts inside Pikachu and is still overlapping it after moving.
+        let pikachu = state.fighters[0].pos;
+        state
+            .projectiles
+            .push(shot(0, THUNDERBOLT, pikachu, Vec2::new(500, 0)));
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        assert!(events.is_empty());
+        assert_eq!(state.fighters[0].hp, state.fighters[0].max_hp);
+        assert_eq!(state.projectiles.len(), 1);
+    }
+
+    #[test]
+    fn thunderbolt_fizzles_at_max_range() {
+        let mut state = new_match();
+        let windup = move_data(THUNDERBOLT).windup;
+        step(&mut state, only_fighter_0(use_move(0)));
+        // Release tick: spawned at x = -6000 and moved once.
+        run(&mut state, [Intent::default(); 2], windup - 1);
+
+        // 8500 range left at 500 per tick: still flying after 16 more ticks...
+        run(&mut state, [Intent::default(); 2], 16);
+        assert_eq!(state.projectiles.len(), 1);
+
+        // ...and spent on the 17th, 9000 units from Pikachu and short of
+        // Blastoise, which is 12,000 away.
+        let events = run(&mut state, [Intent::default(); 2], 1);
+        assert_eq!(
+            events,
+            vec![Event::ProjectileExpired {
+                move_id: THUNDERBOLT,
+                pos: Vec2::new(3_000, 0),
+            }]
+        );
+        assert!(state.projectiles.is_empty());
+        assert_eq!(state.fighters[1].hp, state.fighters[1].max_hp);
+    }
+
+    #[test]
+    fn projectile_expires_when_its_edge_touches_a_wall() {
+        let mut state = new_match();
+        // The right wall is at x = 12,000. After moving, the center is at
+        // 11,900 and the 200-unit edge reaches 12,100.
+        state.projectiles.push(shot(
+            0,
+            THUNDERBOLT,
+            Vec2::new(11_400, -5_000),
+            Vec2::new(500, 0),
+        ));
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        assert!(matches!(events[..], [Event::ProjectileExpired { .. }]));
+        assert!(state.projectiles.is_empty());
+    }
+
+    #[test]
+    fn hp_never_drops_below_zero() {
+        let mut state = new_match();
+        state.fighters[1].hp = 100;
+        state
+            .projectiles
+            .push(shot(0, THUNDERBOLT, Vec2::new(5_000, 0), Vec2::new(500, 0)));
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        assert_eq!(state.fighters[1].hp, 0);
+        // The event still reports the move's full damage.
+        assert!(matches!(events[..], [Event::Hit { damage: 302, .. }]));
+    }
+
+    #[test]
+    fn both_fighters_can_be_hit_on_the_same_tick() {
+        let mut state = new_match();
+        state
+            .projectiles
+            .push(shot(0, THUNDERBOLT, Vec2::new(5_000, 0), Vec2::new(500, 0)));
+        state.projectiles.push(shot(
+            1,
+            WATER_PULSE,
+            Vec2::new(-5_000, 0),
+            Vec2::new(-330, 0),
+        ));
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(state.fighters[0].hp, 2_200 - 270);
+        assert_eq!(state.fighters[1].hp, 3_080 - 302);
     }
 }
