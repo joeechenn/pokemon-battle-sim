@@ -16,9 +16,10 @@
 
 use crate::combat::move_speed;
 use crate::data;
+use crate::data::Archetype;
 use crate::event::Event;
 use crate::math::Vec2;
-use crate::state::{Action, Fighter, Intent, State};
+use crate::state::{Action, Fighter, Intent, Projectile, State, Zone};
 
 // Universal dash: a short movement burst any fighter can use. Starting values,
 // to be tuned through play. Distances in units, durations in ticks.
@@ -63,16 +64,32 @@ fn start_actions(fighters: &mut [Fighter; 2], intents: &[Intent; 2], events: &mu
                 fighter: i as u8,
                 direction,
             });
+        } else if let Some(slot) = intent.move_slot {
+            let species = data::species(f.species);
+            let s = usize::from(slot);
+            // Bad slots are ignored, never a panic. The range check comes
+            // first so the cooldown lookup can't index out of bounds.
+            if s < species.moves.len() && f.move_cooldowns[s] == 0 {
+                let move_id = species.moves[s];
+                let mv = data::move_data(move_id);
+                f.action = Action::Casting {
+                    slot,
+                    ticks_left: mv.windup,
+                };
+                events.push(Event::MoveStarted {
+                    fighter: i as u8,
+                    move_id,
+                });
+            }
         }
-        // TODO: start a move here (`else if let Some(slot) = intent.move_slot`).
     }
 }
 
 /// Advances each fighter's movement by one tick.
 ///
 /// Idle fighters walk if their intent has a direction. Dashes move by their
-/// stored velocity. Action timers (`ticks_left`) count down here; ability
-/// cooldowns count down separately in `tick_cooldowns`.
+/// stored velocity. Dash and recovery timers count down here; windups count
+/// down in `advance_casts`, and ability cooldowns in `tick_cooldowns`.
 fn move_fighters(fighters: &mut [Fighter; 2], intents: &[Intent; 2]) {
     for (i, f) in fighters.iter_mut().enumerate() {
         let intent = intents[i];
@@ -107,8 +124,7 @@ fn move_fighters(fighters: &mut [Fighter; 2], intents: &[Intent; 2]) {
                     }
                 };
             }
-            // Casting fighters stand still. The windup timer will count down
-            // alongside move release, not here (TODO).
+            // Casting fighters stand still; `advance_casts` runs the windup.
             Action::Casting { .. } => {}
             // Standing still; only the timer runs.
             Action::Recovering { ticks_left } => {
@@ -196,6 +212,101 @@ fn tick_cooldowns(fighters: &mut [Fighter; 2]) {
     }
 }
 
+/// Counts windups down and releases moves whose windup has finished.
+///
+/// Moves auto-aim at the opponent's position at the moment of release, so
+/// moving during the windup is how a target dodges. Runs after movement, so
+/// the aim uses where everyone ended up this tick. The cooldown starts at
+/// release.
+fn advance_casts(state: &mut State, events: &mut Vec<Event>) {
+    // Copied up front: the loop borrows `fighters` mutably, so it can't also
+    // read the opponent's position from it.
+    let positions = [state.fighters[0].pos, state.fighters[1].pos];
+
+    for (i, f) in state.fighters.iter_mut().enumerate() {
+        let Action::Casting { slot, ticks_left } = f.action else {
+            continue;
+        };
+        if ticks_left > 1 {
+            f.action = Action::Casting {
+                slot,
+                ticks_left: ticks_left - 1,
+            };
+            continue;
+        }
+        let species = data::species(f.species);
+        let s = usize::from(slot);
+        let move_id = species.moves[s];
+        let mv = data::move_data(move_id);
+        // `1 - i` is the opponent's index. On the same spot there's no
+        // direction to aim, so fire straight ahead.
+        let aim = positions[1 - i] - f.pos;
+        let aim = if aim == Vec2::ZERO {
+            f.facing.to_vec()
+        } else {
+            aim
+        };
+        f.move_cooldowns[s] = mv.cooldown;
+        match mv.archetype {
+            Archetype::Projectile { speed, range, .. } => {
+                state.projectiles.push(Projectile {
+                    owner: i as u8,
+                    move_id,
+                    pos: f.pos,
+                    velocity: aim.with_length(speed),
+                    range_left: range,
+                });
+                f.action = Action::Recovering {
+                    ticks_left: mv.recovery,
+                };
+                events.push(Event::ProjectileSpawned {
+                    owner: i as u8,
+                    move_id,
+                    pos: f.pos,
+                });
+            }
+            Archetype::Zone {
+                delay, cast_range, ..
+            } => {
+                // On the target if it's within reach; otherwise as far as the
+                // move reaches, in the target's direction.
+                let center = if aim.length() > cast_range {
+                    f.pos + aim.with_length(cast_range)
+                } else {
+                    positions[1 - i]
+                };
+                state.zones.push(Zone {
+                    owner: i as u8,
+                    move_id,
+                    center,
+                    ticks_left: delay,
+                });
+                f.action = Action::Recovering {
+                    ticks_left: mv.recovery,
+                };
+                events.push(Event::TelegraphStarted {
+                    owner: i as u8,
+                    move_id,
+                    center,
+                    delay,
+                });
+            }
+            // Nothing spawns: the fighter itself becomes the attack. Its
+            // recovery starts when the lunge ends.
+            Archetype::DashAttack {
+                distance, duration, ..
+            } => {
+                f.action = Action::Lunging {
+                    slot,
+                    velocity: aim.with_length(distance / duration as i32),
+                    ticks_left: duration,
+                    has_hit: false,
+                };
+            }
+        }
+    }
+}
+
 /// Advance the match by one tick. `intents[i]` is fighter `i`'s input.
 ///
 /// Mutates `state` in place and returns what happened this tick for the
@@ -214,7 +325,8 @@ pub fn step(state: &mut State, intents: [Intent; 2]) -> Vec<Event> {
     // `state.arena` is copied while `state.fighters` is borrowed: different
     // fields, so both are allowed at once.
     clamp_to_arena(state.arena, &mut state.fighters);
-    // TODO: moves, projectiles, zones, damage and end-of-match checks.
+    advance_casts(state, &mut events);
+    // TODO: projectiles, zones, lunges, damage and end-of-match checks.
     tick_cooldowns(&mut state.fighters);
 
     state.tick += 1;
@@ -224,7 +336,7 @@ pub fn step(state: &mut State, intents: [Intent; 2]) -> Vec<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{BLASTOISE, PIKACHU};
+    use crate::data::{AQUA_JET, BLASTOISE, PIKACHU, THUNDER, THUNDERBOLT, move_data};
     use crate::math::Dir8;
     use crate::state::Outcome;
 
@@ -250,6 +362,22 @@ mod tests {
             dash: true,
             ..Intent::default()
         }
+    }
+
+    fn use_move(slot: u8) -> Intent {
+        Intent {
+            move_slot: Some(slot),
+            ..Intent::default()
+        }
+    }
+
+    /// Steps `n` times with the same intents; returns the last tick's events.
+    fn run(state: &mut State, intents: [Intent; 2], n: u16) -> Vec<Event> {
+        let mut events = Vec::new();
+        for _ in 0..n {
+            events = step(state, intents);
+        }
+        events
     }
 
     #[test]
@@ -404,5 +532,175 @@ mod tests {
             step(&mut b, [*intent, walk(Dir8::SW)]);
         }
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn using_a_move_starts_its_windup() {
+        let mut state = new_match();
+        let events = step(&mut state, only_fighter_0(use_move(0)));
+        assert_eq!(
+            events,
+            vec![Event::MoveStarted {
+                fighter: 0,
+                move_id: THUNDERBOLT,
+            }]
+        );
+        // The windup already counted down once on the tick it started.
+        assert_eq!(
+            state.fighters[0].action,
+            Action::Casting {
+                slot: 0,
+                ticks_left: move_data(THUNDERBOLT).windup - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn move_on_cooldown_is_ignored() {
+        let mut state = new_match();
+        state.fighters[0].move_cooldowns[0] = 10;
+        let events = step(&mut state, only_fighter_0(use_move(0)));
+        assert!(events.is_empty());
+        assert_eq!(state.fighters[0].action, Action::Idle);
+    }
+
+    #[test]
+    fn slot_out_of_range_is_ignored() {
+        let mut state = new_match();
+        let events = step(&mut state, only_fighter_0(use_move(5)));
+        assert!(events.is_empty());
+        assert_eq!(state.fighters[0].action, Action::Idle);
+    }
+
+    #[test]
+    fn dash_wins_over_a_move_in_the_same_tick() {
+        let mut state = new_match();
+        let intent = Intent {
+            dash: true,
+            move_slot: Some(0),
+            ..Intent::default()
+        };
+        let events = step(&mut state, only_fighter_0(intent));
+        assert!(matches!(events[..], [Event::Dashed { fighter: 0, .. }]));
+        assert!(matches!(state.fighters[0].action, Action::Dashing { .. }));
+    }
+
+    #[test]
+    fn casting_fighter_stands_still() {
+        let mut state = new_match();
+        let start = state.fighters[0].pos;
+        step(&mut state, only_fighter_0(use_move(0)));
+        run(&mut state, only_fighter_0(walk(Dir8::N)), 3);
+        assert!(matches!(state.fighters[0].action, Action::Casting { .. }));
+        assert_eq!(state.fighters[0].pos, start);
+    }
+
+    #[test]
+    fn thunderbolt_releases_a_projectile_aimed_at_the_target() {
+        let mut state = new_match();
+        let mv = move_data(THUNDERBOLT);
+
+        // Press on the first tick; the rest of the windup needs no input.
+        step(&mut state, only_fighter_0(use_move(0)));
+        run(&mut state, [Intent::default(); 2], mv.windup - 2);
+        assert!(state.projectiles.is_empty(), "released too early");
+
+        let events = run(&mut state, [Intent::default(); 2], 1);
+        assert_eq!(
+            state.projectiles,
+            vec![Projectile {
+                owner: 0,
+                move_id: THUNDERBOLT,
+                pos: Vec2::new(-6_000, 0),
+                // Blastoise is due east; 500 is Thunderbolt's speed.
+                velocity: Vec2::new(500, 0),
+                range_left: 9_000,
+            }]
+        );
+        assert!(matches!(
+            events[..],
+            [Event::ProjectileSpawned { owner: 0, .. }]
+        ));
+        assert_eq!(
+            state.fighters[0].action,
+            Action::Recovering {
+                ticks_left: mv.recovery,
+            }
+        );
+        // Set at release, then counted down once at the end of the same tick.
+        assert_eq!(state.fighters[0].move_cooldowns[0], mv.cooldown - 1);
+    }
+
+    #[test]
+    fn aim_uses_the_target_position_at_release() {
+        let mut state = new_match();
+        step(&mut state, only_fighter_0(use_move(0)));
+        // The target moves during the windup: directly south of Pikachu.
+        state.fighters[1].pos = Vec2::new(-6_000, 5_000);
+        run(
+            &mut state,
+            [Intent::default(); 2],
+            move_data(THUNDERBOLT).windup,
+        );
+        assert_eq!(state.projectiles[0].velocity, Vec2::new(0, 500));
+    }
+
+    #[test]
+    fn thunder_out_of_reach_lands_at_max_range() {
+        let mut state = new_match();
+        step(&mut state, only_fighter_0(use_move(1)));
+        let events = run(
+            &mut state,
+            [Intent::default(); 2],
+            move_data(THUNDER).windup - 1,
+        );
+
+        // Blastoise is 12,000 away but Thunder reaches 8,000.
+        assert_eq!(state.zones.len(), 1);
+        assert_eq!(state.zones[0].center, Vec2::new(2_000, 0));
+        assert!(matches!(
+            events[..],
+            [Event::TelegraphStarted {
+                owner: 0,
+                delay: 24,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn thunder_in_reach_lands_on_the_target() {
+        let mut state = new_match();
+        state.fighters[1].pos = Vec2::ZERO;
+        step(&mut state, only_fighter_0(use_move(1)));
+        run(
+            &mut state,
+            [Intent::default(); 2],
+            move_data(THUNDER).windup - 1,
+        );
+        assert_eq!(state.zones[0].center, Vec2::ZERO);
+    }
+
+    #[test]
+    fn aqua_jet_starts_a_lunge_toward_the_target() {
+        let mut state = new_match();
+        let mv = move_data(AQUA_JET);
+        // Blastoise is fighter 1, and Aqua Jet is its second move.
+        step(&mut state, [Intent::default(), use_move(1)]);
+        run(&mut state, [Intent::default(); 2], mv.windup - 1);
+
+        assert_eq!(
+            state.fighters[1].action,
+            Action::Lunging {
+                slot: 1,
+                // Pikachu is due west; 4000 units over 8 ticks.
+                velocity: Vec2::new(-500, 0),
+                ticks_left: 8,
+                has_hit: false,
+            }
+        );
+        assert!(state.projectiles.is_empty());
+        assert!(state.zones.is_empty());
+        assert_eq!(state.fighters[1].move_cooldowns[1], mv.cooldown - 1);
     }
 }
