@@ -13,6 +13,7 @@ pub mod data;
 pub mod event;
 pub mod hash;
 pub mod math;
+pub mod replay;
 pub mod rng;
 pub mod state;
 pub mod step;
