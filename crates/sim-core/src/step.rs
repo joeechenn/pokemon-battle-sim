@@ -19,7 +19,8 @@ use crate::data;
 use crate::data::Archetype;
 use crate::event::Event;
 use crate::math::Vec2;
-use crate::state::{Action, Fighter, Intent, Projectile, State, Zone};
+use crate::state::{Action, Fighter, Intent, Outcome, Projectile, State, Zone};
+use std::cmp::Ordering;
 
 // Universal dash: a short movement burst any fighter can use. Starting values,
 // to be tuned through play. Distances in units, durations in ticks.
@@ -35,6 +36,10 @@ pub const DASH_SPEED: i32 = DASH_DISTANCE / DASH_TICKS as i32;
 pub const DASH_COOLDOWN: u16 = 60;
 /// Ticks spent in `Recovering` after a dash ends, before acting again.
 pub const DASH_RECOVERY: u16 = 3;
+
+/// Match length: 60 seconds. When it runs out, the higher HP percentage wins.
+/// Starting value, to be tuned through play.
+pub const MATCH_TICKS: u32 = 60 * crate::TICKS_PER_SECOND;
 
 /// Turns intents into new actions.
 ///
@@ -469,6 +474,52 @@ fn lunge_hits(state: &mut State, events: &mut Vec<Event>) {
     }
 }
 
+/// Decides whether the match is over, and how.
+///
+/// Runs last in `step`, after every hit this tick, so knockouts in the same
+/// tick count as simultaneous. Faints decide first: one fighter down loses,
+/// both down is a draw. Otherwise, once `MATCH_TICKS` have passed, the higher
+/// HP percentage wins. When the match ends, `Fainted` events come first, then
+/// `MatchEnded`, and `state.outcome` is set so later steps do nothing.
+fn check_end(state: &mut State, events: &mut Vec<Event>) {
+    for (i, f) in state.fighters.iter().enumerate() {
+        if f.hp == 0 {
+            events.push(Event::Fainted { fighter: i as u8 });
+        }
+    }
+
+    let down = [state.fighters[0].hp == 0, state.fighters[1].hp == 0];
+    let outcome = match down {
+        [true, true] => Some(Outcome::Draw),
+        [true, false] => Some(Outcome::Winner(1)),
+        [false, true] => Some(Outcome::Winner(0)),
+        // Match guard: this arm only applies once time is up.
+        [false, false] if state.tick >= MATCH_TICKS => Some(timeout_result(&state.fighters)),
+        [false, false] => None,
+    };
+
+    if let Some(outcome) = outcome {
+        state.outcome = Some(outcome);
+        events.push(Event::MatchEnded { outcome });
+    }
+}
+
+/// Who wins when time runs out: the higher HP percentage, or a draw if equal.
+///
+/// Compares `hp0 / max0` with `hp1 / max1` by cross-multiplying
+/// (`hp0 * max1` vs `hp1 * max0`), which is exact with integers; dividing
+/// first would round both sides down and could hide the difference.
+fn timeout_result(fighters: &[Fighter; 2]) -> Outcome {
+    let [a, b] = fighters;
+    let share_0 = i64::from(a.hp) * i64::from(b.max_hp);
+    let share_1 = i64::from(b.hp) * i64::from(a.max_hp);
+    match share_0.cmp(&share_1) {
+        Ordering::Greater => Outcome::Winner(0),
+        Ordering::Less => Outcome::Winner(1),
+        Ordering::Equal => Outcome::Draw,
+    }
+}
+
 /// Advance the match by one tick. `intents[i]` is fighter `i`'s input.
 ///
 /// Mutates `state` in place and returns what happened this tick for the
@@ -491,10 +542,10 @@ pub fn step(state: &mut State, intents: [Intent; 2]) -> Vec<Event> {
     advance_casts(state, &mut events);
     advance_projectiles(state, &mut events);
     advance_zones(state, &mut events);
-    // TODO: faints and end-of-match checks.
     tick_cooldowns(&mut state.fighters);
-
     state.tick += 1;
+    // Last, so it sees every hit this tick and the updated tick count.
+    check_end(state, &mut events);
     events
 }
 
@@ -1014,8 +1065,9 @@ mod tests {
         let events = step(&mut state, [Intent::default(); 2]);
 
         assert_eq!(state.fighters[1].hp, 0);
-        // The event still reports the move's full damage.
-        assert!(matches!(events[..], [Event::Hit { damage: 302, .. }]));
+        // The event still reports the move's full damage. (The knockout
+        // events that follow are covered by the end-of-match tests.)
+        assert!(matches!(events[0], Event::Hit { damage: 302, .. }));
     }
 
     #[test]
@@ -1275,5 +1327,144 @@ mod tests {
         run(&mut state, [Intent::default(); 2], 8);
         let radius = data::species(BLASTOISE).radius;
         assert_eq!(state.fighters[1].pos.x, state.arena.x - radius);
+    }
+
+    /// Puts a Thunderbolt one tick away from hitting Blastoise.
+    fn thunderbolt_about_to_hit_blastoise(state: &mut State) {
+        state
+            .projectiles
+            .push(shot(0, THUNDERBOLT, Vec2::new(5_000, 0), Vec2::new(500, 0)));
+    }
+
+    /// Puts a Water Pulse one tick away from hitting Pikachu.
+    fn water_pulse_about_to_hit_pikachu(state: &mut State) {
+        state.projectiles.push(shot(
+            1,
+            WATER_PULSE,
+            Vec2::new(-5_000, 0),
+            Vec2::new(-330, 0),
+        ));
+    }
+
+    /// One step with no input, starting on the last tick before time runs out.
+    fn step_into_timeout(state: &mut State) -> Vec<Event> {
+        state.tick = MATCH_TICKS - 1;
+        step(state, [Intent::default(); 2])
+    }
+
+    #[test]
+    fn knockout_ends_the_match() {
+        let mut state = new_match();
+        state.fighters[1].hp = 100;
+        thunderbolt_about_to_hit_blastoise(&mut state);
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        // The hit, then the faint, then the result.
+        assert!(matches!(
+            events[..],
+            [
+                Event::Hit { .. },
+                Event::Fainted { fighter: 1 },
+                Event::MatchEnded {
+                    outcome: Outcome::Winner(0)
+                },
+            ]
+        ));
+        assert_eq!(state.outcome, Some(Outcome::Winner(0)));
+    }
+
+    #[test]
+    fn double_knockout_is_a_draw() {
+        let mut state = new_match();
+        state.fighters[0].hp = 100;
+        state.fighters[1].hp = 100;
+        thunderbolt_about_to_hit_blastoise(&mut state);
+        water_pulse_about_to_hit_pikachu(&mut state);
+        let events = step(&mut state, [Intent::default(); 2]);
+
+        // Both hits land before faints are checked, so neither side wins.
+        assert_eq!(
+            events[2..],
+            [
+                Event::Fainted { fighter: 0 },
+                Event::Fainted { fighter: 1 },
+                Event::MatchEnded {
+                    outcome: Outcome::Draw,
+                },
+            ]
+        );
+        assert_eq!(state.outcome, Some(Outcome::Draw));
+    }
+
+    #[test]
+    fn match_is_frozen_after_a_knockout() {
+        let mut state = new_match();
+        state.fighters[1].hp = 100;
+        thunderbolt_about_to_hit_blastoise(&mut state);
+        step(&mut state, [Intent::default(); 2]);
+
+        let before = state.clone();
+        for _ in 0..30 {
+            let events = step(&mut state, [dash(), use_move(1)]);
+            assert!(events.is_empty());
+        }
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn match_runs_until_time_is_up() {
+        let mut state = new_match();
+        state.tick = MATCH_TICKS - 2;
+        step(&mut state, [Intent::default(); 2]);
+        assert_eq!(state.outcome, None, "one tick left");
+
+        let events = step(&mut state, [Intent::default(); 2]);
+        assert_eq!(state.tick, MATCH_TICKS);
+        assert!(matches!(events[..], [Event::MatchEnded { .. }]));
+    }
+
+    #[test]
+    fn timeout_higher_hp_percentage_wins() {
+        let mut state = new_match();
+        state.fighters[0].hp = 1_100; // 50% of 2200
+        state.fighters[1].hp = 1_848; // 60% of 3080
+        let events = step_into_timeout(&mut state);
+
+        assert_eq!(
+            events,
+            vec![Event::MatchEnded {
+                outcome: Outcome::Winner(1),
+            }]
+        );
+        assert_eq!(state.outcome, Some(Outcome::Winner(1)));
+    }
+
+    #[test]
+    fn timeout_compares_percentages_not_raw_hp() {
+        let mut state = new_match();
+        state.fighters[0].hp = 2_000; // about 91%
+        state.fighters[1].hp = 2_500; // about 81%, but more HP
+        step_into_timeout(&mut state);
+        assert_eq!(state.outcome, Some(Outcome::Winner(0)));
+    }
+
+    #[test]
+    fn timeout_with_equal_percentages_is_a_draw() {
+        let mut state = new_match();
+        state.fighters[0].hp = 1_100; // exactly 50%
+        state.fighters[1].hp = 1_540; // exactly 50%
+        step_into_timeout(&mut state);
+        assert_eq!(state.outcome, Some(Outcome::Draw));
+    }
+
+    #[test]
+    fn timeout_tells_apart_close_percentages() {
+        // 1999/2200 (90.86%) vs 2800/3080 (90.91%): dividing first would call
+        // this a tie; cross-multiplying sees Blastoise is slightly ahead.
+        let mut state = new_match();
+        state.fighters[0].hp = 1_999;
+        state.fighters[1].hp = 2_800;
+        step_into_timeout(&mut state);
+        assert_eq!(state.outcome, Some(Outcome::Winner(1)));
     }
 }
